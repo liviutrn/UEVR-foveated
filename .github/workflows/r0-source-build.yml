@@ -23,10 +23,24 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:UESDK_PULLER)) {
             throw "Repository secret UESDK_PULLER is missing. Add a READ-ONLY GitHub access token with permission to clone remleo/UESDK (and any needed nested private submodules), then re-run this job."
           }
-      - name: Checkout baseline source with private submodules
+      - name: Checkout baseline UEVR with built-in GitHub token
         uses: actions/checkout@v4
         with:
+          submodules: false
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Checkout pinned public dependencies
+        shell: pwsh
+        run: |
+          git submodule update --init --recursive -- dependencies/submodules/glm dependencies/submodules/imgui dependencies/submodules/spdlog
+          if ($LASTEXITCODE -ne 0) { throw "Public submodule initialization failed" }
+      - name: Checkout exact remleo UESDK (separate private authentication)
+        uses: actions/checkout@v4
+        with:
+          repository: Remleo/UESDK
+          ref: b1c6534652bd7381ad16e25f0507e3162e4b4691
           token: ${{ secrets.UESDK_PULLER }}
+          path: dependencies/submodules/UESDK
           submodules: recursive
           persist-credentials: false
           fetch-depth: 0
