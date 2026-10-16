@@ -92,6 +92,24 @@ jobs:
           foreach ($name in @("UEVRBackend.dll", "UEVRInjector.exe")) {
             if (-not (Test-Path "build/bin/uevr/$name")) { throw "Missing compiled $name" }
           }
+      - name: Validate DuoView implementation is in the compiled DLL
+        shell: pwsh
+        run: |
+          $dll = "build/bin/uevr/UEVRBackend.dll"
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          if ($bytes.Length -lt 1000000 -or $bytes[0] -ne 77 -or $bytes[1] -ne 90) {
+            throw "Invalid or unexpectedly small compiled Windows backend"
+          }
+          $marker = "[DuoView] Initialized fixed mono GPU views"
+          $contents = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $contents.Contains($marker)) {
+            throw "Compiled DLL has no DuoView GPU compositor marker: wrong build or dead-stripped feature"
+          }
+          $baselineHash = "BBA0AC1FBBA17D1190A4F73F7E196F44F70038EE5DC7E192A42ED39E013AD46F"
+          if ((Get-FileHash $dll -Algorithm SHA256).Hash -eq $baselineHash) {
+            throw "Backend is byte-for-byte equal to remleo r0: DuoView build missing"
+          }
+          Write-Host "DuoView GPU path verified in newly built backend"
       - name: Fetch original package to preserve untouched dependencies
         shell: pwsh
         run: |
