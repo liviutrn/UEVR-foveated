@@ -24,7 +24,171 @@ constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOUR
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
 namespace vrmod {
+
+// Destroy only DuoView-owned resources. Never touch the original r6 render targets.
+void D3D12Component::duo_reset() {
+    m_duo_first_valid = false;
+    m_duo_composed = false;
+    m_duo_first_frame = 0;
+    m_duo_full_width = 0;
+    m_duo_full_height = 0;
+    m_duo_fovea_width = 0;
+    m_duo_fovea_height = 0;
+    m_duo_peripheral_width = 0;
+    m_duo_peripheral_height = 0;
+    m_duo_format = DXGI_FORMAT_UNKNOWN;
+    m_duo_output.reset();
+    m_duo_fovea.reset();
+    m_duo_periphery.reset();
+}
+
+bool D3D12Component::duo_create_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& game_desc) {
+    // No implicit conversion, multisampled resource, odd-width clipping, or
+    // unsupported image layout. These can create GPU command-list failures.
+    if (device == nullptr || game_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        game_desc.SampleDesc.Count != 1 || game_desc.Width < 128 || game_desc.Height < 128 ||
+        (game_desc.Width % 2) != 0 || game_desc.DepthOrArraySize != 1 ||
+        game_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] Cannot create compositor: unsupported game render-target geometry/format");
+        return false;
+    }
+
+    const auto eye_width = static_cast<UINT>(game_desc.Width / 2);
+    const auto eye_height = static_cast<UINT>(game_desc.Height);
+    const auto fovea_width = std::max<UINT>(16, static_cast<UINT>(eye_width * 0.5f));
+    const auto fovea_height = std::max<UINT>(16, static_cast<UINT>(eye_height * 0.5f));
+    const auto peripheral_width = std::max<UINT>(16, static_cast<UINT>(eye_width * 0.3f));
+    const auto peripheral_height = std::max<UINT>(16, static_cast<UINT>(eye_height * 0.3f));
+
+    if (m_duo_output.texture != nullptr && m_duo_full_width == eye_width && m_duo_full_height == eye_height &&
+        m_duo_format == game_desc.Format && m_duo_fovea_width == fovea_width &&
+        m_duo_fovea_height == fovea_height && m_duo_peripheral_width == peripheral_width &&
+        m_duo_peripheral_height == peripheral_height) {
+        return true;
+    }
+
+    // Device/resolution changes invalidate BOTH stored views, not just the output.
+    m_openxr.wait_for_all_copies();
+    duo_reset();
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto make_texture = [&](d3d12::TextureContext& ctx, UINT w, UINT h, const wchar_t* label,
+                            D3D12_RESOURCE_STATES initial_state) {
+        auto desc = game_desc;
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.DepthOrArraySize = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        ComPtr<ID3D12Resource> texture{};
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, initial_state,
+                                                    nullptr, IID_PPV_ARGS(&texture)))) {
+            spdlog::error("[DuoView] Unable to allocate GPU texture.");
+            return false;
+        }
+        return ctx.setup(device, texture.Get(), DXGI_FORMAT_B8G8R8A8_UNORM,
+                         DXGI_FORMAT_B8G8R8A8_UNORM, label) && ctx.commands.ready();
+    };
+
+    if (!make_texture(m_duo_fovea, fovea_width, fovea_height, L"DuoView Center View", D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) ||
+        !make_texture(m_duo_periphery, peripheral_width, peripheral_height, L"DuoView Peripheral View", D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) ||
+        !make_texture(m_duo_output, eye_width, eye_height, L"DuoView Mono Composite", D3D12_RESOURCE_STATE_RENDER_TARGET)) {
+        duo_reset();
+        return false;
+    }
+
+    m_duo_full_width = eye_width;
+    m_duo_full_height = eye_height;
+    m_duo_fovea_width = fovea_width;
+    m_duo_fovea_height = fovea_height;
+    m_duo_peripheral_width = peripheral_width;
+    m_duo_peripheral_height = peripheral_height;
+    m_duo_format = game_desc.Format;
+    spdlog::info("[DuoView] Initialized fixed mono GPU views: full {}x{}, fovea {}x{}, periphery {}x{}",
+                 eye_width, eye_height, fovea_width, fovea_height, peripheral_width, peripheral_height);
+    return true;
+}
+
+bool D3D12Component::duo_composite(VR* vr, ID3D12Resource* game_rt, bool first_view, bool second_view) {
+    m_duo_composed = false;
+
+    if (!vr->get_runtime()->is_openxr() || vr->is_extreme_compatibility_mode_enabled() ||
+        vr->is_using_2d_screen() || game_rt == nullptr || m_game_batch == nullptr) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] REJECTED: requires DX12 + OpenXR, normal game render target, and 3D mode");
+        m_duo_first_valid = false;
+        return false;
+    }
+
+    if (!duo_create_textures(g_framework->get_d3d12_hook()->get_device(), game_rt->GetDesc())) {
+        m_duo_first_valid = false;
+        return false;
+    }
+
+    const auto frame = vr->m_render_frame_count;
+    if (first_view && !second_view) {
+        // Capture the 50%-width native-density central pass BEFORE UE reuses
+        // the same render target for the low-resolution peripheral draw.
+        D3D12_BOX box{0, 0, 0, m_duo_fovea_width, m_duo_fovea_height, 1};
+        auto& cmd = m_duo_fovea.commands;
+        cmd.wait(INFINITE);
+        cmd.copy_region(game_rt, m_duo_fovea.texture.Get(), &box,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd.execute();
+        m_duo_first_frame = frame;
+        m_duo_first_valid = true;
+        return false; // never submit an incomplete single-view DuoView pair
+    }
+
+    if (!second_view || first_view || !m_duo_first_valid ||
+        frame != m_duo_first_frame + 1u) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] Pair missing/out of order: holding compositor instead of stereo fallback");
+        m_duo_first_valid = false;
+        return false;
+    }
+
+    // Second pass is a full-FOV mono projection drawn at 0.3 of each dimension.
+    const auto right_start = m_duo_full_width;
+    D3D12_BOX box{right_start, 0, 0, right_start + m_duo_peripheral_width,
+                  m_duo_peripheral_height, 1};
+    auto& cmd_periphery = m_duo_periphery.commands;
+    cmd_periphery.wait(INFINITE);
+    cmd_periphery.copy_region(game_rt, m_duo_periphery.texture.Get(), &box,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmd_periphery.execute();
+
+    // GPU composition happens AFTER both sequential draws. The sprites use
+    // the same coordinates as the rects set by AdjustViewRect. No temporal
+    // history, motion-vector reprojection or gaze interpolation is involved.
+    auto& cmd = m_duo_output.commands;
+    cmd.wait(INFINITE);
+    d3d12::render_srv_to_rtv(m_game_batch.get(), cmd.cmd_list.Get(), m_duo_periphery,
+                             m_duo_output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const LONG fx = static_cast<LONG>((m_duo_full_width - m_duo_fovea_width) / 2);
+    const LONG fy = static_cast<LONG>((m_duo_full_height - m_duo_fovea_height) / 2);
+    RECT center{fx, fy, fx + static_cast<LONG>(m_duo_fovea_width),
+                fy + static_cast<LONG>(m_duo_fovea_height)};
+    d3d12::render_srv_to_rtv(m_game_batch.get(), cmd.cmd_list.Get(), m_duo_fovea,
+                             m_duo_output, std::nullopt, center,
+                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmd.execute();
+    m_duo_first_valid = false;
+    m_duo_composed = true;
+    return true;
+}
+
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
+    // Changing between stereo and DuoView must reset pair-history even
+    // though both methods use the synchronized AFR scheduler.
+    if (m_last_duo_state != vr->is_duoview_fixed()) {
+        m_last_duo_state = vr->is_duoview_fixed();
+        m_force_reset = true;
+    }
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
             SPDLOG_ERROR_EVERY_N_SEC(1, "[D3D12 VR] Could not set up, trying again next frame");
@@ -68,6 +232,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     if (backbuffer == nullptr) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] Failed to get back buffer.");
+        return vr::VRCompositorError_None;
+    }
+
+    if (vr->is_duoview_fixed() && !vr->get_runtime()->is_openxr()) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] OpenXR runtime required. No stereo fallback.");
         return vr::VRCompositorError_None;
     }
 
@@ -499,12 +668,25 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     #endif
     }
 
+    // Pair the two explicit sequential scene renders BEFORE copying to the
+    // runtime. Fail closed; an incomplete pair is never silently displayed as
+    // ordinary stereo.
+    if (vr->is_duoview_fixed()) {
+        if (!duo_composite(vr, backbuffer.Get(), is_left_eye_frame, is_right_eye_frame)) {
+            if (is_right_eye_frame) {
+                SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] Incomplete GPU composition; skipping VR submit");
+            }
+            // On the first half normal on_frame still runs to maintain frame
+            // lifecycle, but no eye image is acquired until composition.
+        }
+    }
+
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
         m_submitted_left_eye = true;
 
         // OpenXR texture
-        if (runtime->is_openxr() && vr->m_openxr->ready()) {
+        if (!vr->is_duoview_fixed() && runtime->is_openxr() && vr->m_openxr->ready()) {
             D3D12_BOX src_box{};
             src_box.left = 0;
             src_box.top = 0;
@@ -559,7 +741,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         // OpenXR texture
         if (runtime->is_openxr() && vr->m_openxr->ready()) {
-            if (is_actually_afr && !is_afr && !m_submitted_left_eye) {
+            if (!vr->is_duoview_fixed() && is_actually_afr && !is_afr && !m_submitted_left_eye) {
                 D3D12_BOX src_box{};
                 src_box.left = 0;
                 src_box.top = 0;
@@ -580,7 +762,17 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
-            if (is_actually_afr) {
+            if (vr->is_duoview_fixed()) {
+                if (m_duo_composed && m_duo_output.texture != nullptr) {
+                    auto* mono = m_duo_output.texture.Get();
+                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE,
+                                  mono, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE,
+                                  mono, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                } else {
+                    SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] No complete mono image; suppressing both XR eye copies");
+                }
+            } else if (is_actually_afr) {
                 D3D12_BOX src_box{};
 
                 if (!vr->is_extreme_compatibility_mode_enabled()) {
@@ -1154,6 +1346,7 @@ void D3D12Component::on_reset(VR* vr) {
     m_game_ui_tex.reset();
     m_game_tex.reset();
     m_scene_capture_tex.reset();
+    duo_reset();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
     m_ui_batch_alpha_invert.reset();
