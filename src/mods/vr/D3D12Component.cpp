@@ -118,7 +118,7 @@ bool D3D12Component::duo_composite(VR* vr, ID3D12Resource* game_rt, bool first_v
     m_duo_composed = false;
 
     if (!vr->get_runtime()->is_openxr() || vr->is_extreme_compatibility_mode_enabled() ||
-        vr->is_using_2d_screen() || game_rt == nullptr || m_game_batch == nullptr) {
+        vr->is_using_2d_screen() || game_rt == nullptr || m_duo_batch == nullptr) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] REJECTED: requires DX12 + OpenXR, normal game render target, and 3D mode");
         m_duo_first_valid = false;
         return false;
@@ -166,14 +166,14 @@ bool D3D12Component::duo_composite(VR* vr, ID3D12Resource* game_rt, bool first_v
     // history, motion-vector reprojection or gaze interpolation is involved.
     auto& cmd = m_duo_output.commands;
     cmd.wait(INFINITE);
-    d3d12::render_srv_to_rtv(m_game_batch.get(), cmd.cmd_list.Get(), m_duo_periphery,
+    d3d12::render_srv_to_rtv(m_duo_batch.get(), cmd.cmd_list.Get(), m_duo_periphery,
                              m_duo_output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                              D3D12_RESOURCE_STATE_RENDER_TARGET);
     const LONG fx = static_cast<LONG>((m_duo_full_width - m_duo_fovea_width) / 2);
     const LONG fy = static_cast<LONG>((m_duo_full_height - m_duo_fovea_height) / 2);
     RECT center{fx, fy, fx + static_cast<LONG>(m_duo_fovea_width),
                 fy + static_cast<LONG>(m_duo_fovea_height)};
-    d3d12::render_srv_to_rtv(m_game_batch.get(), cmd.cmd_list.Get(), m_duo_fovea,
+    d3d12::render_srv_to_rtv(m_duo_batch.get(), cmd.cmd_list.Get(), m_duo_fovea,
                              m_duo_output, std::nullopt, center,
                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cmd.execute();
@@ -1349,6 +1349,7 @@ void D3D12Component::on_reset(VR* vr) {
     duo_reset();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
+    m_duo_batch.reset();
     m_ui_batch_alpha_invert.reset();
     m_graphics_memory.reset();
 
@@ -1542,6 +1543,20 @@ bool D3D12Component::setup() {
 
     m_backbuffer_batch = setup_sprite_batch_pso(real_backbuffer_desc.Format);
     m_game_batch = setup_sprite_batch_pso(backbuffer_desc.Format);
+
+    if (vr->is_duoview_fixed()) {
+        DirectX::SpriteBatchPipelineStateDescription duo_pd{
+            DirectX::RenderTargetState{backbuffer_desc.Format, DXGI_FORMAT_UNKNOWN}
+        };
+        auto& blend = duo_pd.blendDesc.RenderTarget[0];
+        blend.BlendEnable = FALSE;
+        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        m_duo_batch = setup_sprite_batch_pso(backbuffer_desc.Format, {}, {}, duo_pd);
+        if (m_duo_batch == nullptr) {
+            spdlog::error("[DuoView] Opaque GPU compositor pipeline could not be created");
+            return false;
+        }
+    }
 
     // Custom blend state to flip the alpha in-place of the UI texture without an intermediate render target
     {
