@@ -26,7 +26,18 @@ GitHub's `GITHUB_TOKEN` for this repository cannot automatically clone private r
 
 `Settings -> Secrets and variables -> Actions -> New repository secret`.
 
-Set the value to an authorized access token with **read-only Contents access** to `remleo/UESDK` and any nested private repositories required for its submodules. Prefer a limited-scope fine-grained token where the repository owner allows it; otherwise an appropriately restricted classic PAT may be necessary. Do **not** post tokens in issues, pull requests, chat or logs. Once configured, rerun the failed source-build job; or make this branch default and run its manual workflow. **Access in your GitHub browser alone is not enough for Actions.**
+The UESDK belongs to another personal-account owner. A fine-grained token created with your own account as **resource owner** cannot select that other owner's private repository. If you cannot select `remleo/UESDK`, use a **classic personal access token** while your GitHub account has access.
+
+1. Open https://github.com/settings/tokens/new (classic, **not fine-grained**).
+2. Note: `UEVR SDK Build`; expiration: **7 days**.
+3. Under Select scopes, choose **repo** (the one main scope, no other scopes).
+4. Generate and copy the token. Treat it like a password. It has broad private repository rights; revoke after the initial build or replace with safer long-term authentication.
+5. In https://github.com/liviutrn/UEVR-foveated/settings/secrets/actions edit **UESDK_PULLER** and paste the new token. NEVER paste the token in chat, workflow source, a PR, or a log.
+6. Rerun the failed source workflow.
+
+The build workflow uses GitHub's built-in token to check out our public fork, then separately checks out the `remleo/UESDK` gitlink with `UESDK_PULLER`, minimizing the token's use. A browser session alone does not grant the runner private repo access.
+
+Do **not** publish a private Unreal-derived UESDK to our public UEVR source repository. Forking remleo's private repository is unnecessary, and permission to create a private fork depends on its owner's policy.
 
 Note: EpicGames/UnrealEngine is *not* a drop-in replacement for remleo/UESDK. Also, the connected GitHub app currently gets 404 for both `remleo/UESDK` and `praydog/UESDK` despite user browser access.
 
