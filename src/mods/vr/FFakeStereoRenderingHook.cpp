@@ -4866,10 +4866,24 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     *w = *w / 2;
 
-    const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+    const auto vr = VR::get();
+    // Synced sequential may be given the SAME UE view index on both draws. Use the
+    // source-frame parity, the same index used by the pose/projection hooks.
+    const auto true_index = vr->is_duoview_fixed() ? (g_frame_count % 2) :
+                            (index_starts_from_one ? ((index + 1) % 2) : (index % 2));
 
-    if (!VR::get()->is_native_stereo_fix_enabled()) {
+    if (!vr->is_native_stereo_fix_enabled() || vr->is_duoview_fixed()) {
         *x += *w * true_index;
+    }
+
+    if (vr->is_duoview_fixed()) {
+        // Fixed mono DuoView: view 0 draws the central 50% FOV at native pixel
+        // density; view 1 draws the WHOLE FOV at 30% pixel resolution.
+        // Source rectangles are left/top anchored deliberately; the GPU
+        // compositor later places the fovea at the centre of both eye outputs.
+        const float scale = true_index == 0 ? 0.5f : 0.3f;
+        *w = std::max<uint32_t>(16, static_cast<uint32_t>(*w * scale));
+        *h = std::max<uint32_t>(16, static_cast<uint32_t>(*h * scale));
     }
 }
 
@@ -5193,7 +5207,11 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // head at full speed while the view takes a fraction, and the two fight.
         const auto scaled_head_rotation = vr->apply_zoom_to_head_rotation(glm::quat{vr->get_rotation(0)});
         const auto current_hmd_rotation = glm::normalize(rotation_offset * scaled_head_rotation);
-        const auto current_eye_rotation_offset = glm::normalize(glm::quat{vr->get_eye_transform(true_index)});
+        // No binocular separation: both sequential view renders share one head
+        // pose. Per-eye offsets would produce double edges after mono compositing.
+        const auto current_eye_rotation_offset = vr->is_duoview_fixed()
+            ? glm::identity<glm::quat>()
+            : glm::normalize(glm::quat{vr->get_eye_transform(true_index)});
 
         // While the view follows the aim, the eye sits on the game's own camera.
         //
@@ -5212,7 +5230,9 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         standing_delta.y += follow_blend.height;
 
         const auto new_rotation = glm::normalize(follow_blend.rotation * vqi_norm * current_hmd_rotation * current_eye_rotation_offset);
-        const auto eye_offset = glm::vec3{vr->get_eye_offset((VRRuntime::Eye)(true_index))};
+        const auto eye_offset = vr->is_duoview_fixed()
+            ? glm::vec3{0.0f}
+            : glm::vec3{vr->get_eye_offset((VRRuntime::Eye)(true_index))};
 
         const auto standing_delta_flat = glm::vec3{standing_delta.x, 0, standing_delta.z};
 
@@ -5240,7 +5260,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         if (!is_2d_screen) {
             // A canted projection yaws the camera onto the middle of the eye's field (OpenXR.cpp); only the
             // direction turns, the eye stays where eye_separation put it.
-            const auto canted_yaw = (true_index >= 0 && true_index < 2) ? vr->get_runtime()->canted_yaw[true_index] : 0.0f;
+            const auto canted_yaw = vr->is_duoview_fixed() ? 0.0f :
+                ((true_index >= 0 && true_index < 2) ? vr->get_runtime()->canted_yaw[true_index] : 0.0f);
             const auto view_rotation_eye = canted_yaw != 0.0f
                 ? glm::normalize(new_rotation * glm::angleAxis(canted_yaw, glm::vec3{0.0f, 1.0f, 0.0f}))
                 : new_rotation;
@@ -5476,9 +5497,9 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         VR::get()->get_runtime()->capture_projection();
 
         if (!g_hook->m_has_double_precision) {
-            *out = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
+            *out = VR::get()->get_projection_matrix((VRRuntime::Eye)(vr->is_duoview_fixed() ? 0 : true_index));
         } else {
-            const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
+            const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(vr->is_duoview_fixed() ? 0 : true_index));
             double_matrix = fmat;
         }
 
@@ -5497,10 +5518,14 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         // scaled alone it would magnify about that axis and swing the eye's line of sight away by z times
         // the yaw (Quest, x3 scope: 13 degrees). The offset then keeps the eye's own straight-ahead, at
         // tangent tan(yaw) right of the axis, where it lands unmagnified: m[2][0] -= (z - 1) m[0][0] tan(yaw).
-        const auto zoom = vr->get_zoom_factor();
+        // The central image is rendered at half-size viewport but at 2x
+        // projection magnification: it covers the centre 50% of the full FOV.
+        // The peripheral image keeps the original field of view.
+        const auto zoom = vr->get_zoom_factor() * ((vr->is_duoview_fixed() && true_index == 0) ? 2.0f : 1.0f);
 
         if (zoom > 1.0f) {
-            const auto canted_yaw = (true_index >= 0 && true_index < 2) ? vr->get_runtime()->canted_yaw[true_index] : 0.0f;
+            const auto canted_yaw = vr->is_duoview_fixed() ? 0.0f :
+                ((true_index >= 0 && true_index < 2) ? vr->get_runtime()->canted_yaw[true_index] : 0.0f);
             const auto straight_ahead = std::tan(canted_yaw);
 
             if (!g_hook->m_has_double_precision) {
