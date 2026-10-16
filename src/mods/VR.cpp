@@ -2327,6 +2327,13 @@ void VR::on_present() {
         }
     }
 
+    if (is_duoview_fixed() && renderer != Framework::RendererType::D3D12) {
+        // The fixed mono pipeline is explicitly D3D12+OpenXR. Never pretend
+        // that D3D11 stereo is DuoView when the GPU composite cannot run.
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[DuoView] Unsupported renderer (DX12 required). Not submitting stereo fallback.");
+        return;
+    }
+
     if (renderer == Framework::RendererType::D3D11) {
         // if we don't do this then D3D11 OpenXR freezes for some reason.
         if (!runtime->got_first_sync) {
@@ -2695,6 +2702,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
     if (selected_page == PAGE_UNREAL) {
         m_rendering_method->draw("Rendering Method");
+        if (is_duoview_fixed()) {
+            ImGui::TextWrapped("DuoView Fixed Mono v1: two synchronized UE scene draws, 50%% center FOV at native density, 30%% periphery resolution. DX12 + OpenXR only. No eye tracking. No stereo fallback.");
+            ImGui::TextWrapped("Render output is MONO in both eyes. Switch back to Synchronized Sequential to compare baseline.");
+        }
         m_synced_afr_method->draw("Synced Sequential Method");
 
         m_world_scale->draw("World Scale");
