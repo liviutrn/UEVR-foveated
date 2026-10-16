@@ -92,6 +92,9 @@ private:
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};
+    // Opaque sprite compositing: alpha in UE render targets must not make
+    // the fovea transparent, or reveal stale peripheral pixels beneath it.
+    std::unique_ptr<DirectX::DX12::SpriteBatch> m_duo_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_ui_batch_alpha_invert{};
 
     ID3D12Resource* m_last_checked_native{nullptr};
