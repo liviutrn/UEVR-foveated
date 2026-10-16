@@ -52,6 +52,11 @@ private:
         std::optional<DirectX::SpriteBatchPipelineStateDescription> pd = std::nullopt
     );
 
+    // Explicit fixed-foveated sequential MONO compositing. The two UE renders
+    // are captured into separate small textures, then combined on the GPU.
+    bool duo_composite(VR* vr, ID3D12Resource* game_rt, bool first_view, bool second_view);
+    bool duo_create_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& game_desc);
+    void duo_reset();
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
 
@@ -66,6 +71,21 @@ private:
     d3d12::TextureContext m_game_tex{};
     d3d12::TextureContext m_scene_capture_tex{};
     std::array<d3d12::CommandContext, 3> m_game_tex_commands{};
+
+    d3d12::TextureContext m_duo_fovea{};
+    d3d12::TextureContext m_duo_periphery{};
+    d3d12::TextureContext m_duo_output{};
+    UINT m_duo_full_width{0};
+    UINT m_duo_full_height{0};
+    UINT m_duo_fovea_width{0};
+    UINT m_duo_fovea_height{0};
+    UINT m_duo_peripheral_width{0};
+    UINT m_duo_peripheral_height{0};
+    DXGI_FORMAT m_duo_format{DXGI_FORMAT_UNKNOWN};
+    uint32_t m_duo_first_frame{0};
+    bool m_duo_first_valid{false};
+    bool m_duo_composed{false};
+    bool m_last_duo_state{false};
     std::array<d3d12::TextureContext, 2> m_2d_screen_tex{};
     std::vector<std::unique_ptr<d3d12::TextureContext>> m_backbuffer_textures{};
 
