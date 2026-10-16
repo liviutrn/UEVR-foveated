@@ -5538,6 +5538,21 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                 double_matrix[1][1] *= (double)zoom;
             }
         }
+
+        if (vr->is_duoview_fixed() && true_index == 0) {
+            // Crucial off-axis alignment: a projection which covers the
+            // central 50% of the periphery and is drawn into a centred
+            // 50%-sized rectangle must double BOTH its focal terms AND its
+            // principal-point offsets. Doubling focal terms alone gives a
+            // visible foveal seam with PSVR2's asymmetric eye tangents.
+            if (!g_hook->m_has_double_precision) {
+                (*out)[2][0] *= 2.0f;
+                (*out)[2][1] *= 2.0f;
+            } else {
+                double_matrix[2][0] *= 2.0;
+                double_matrix[2][1] *= 2.0;
+            }
+        }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");
     }
