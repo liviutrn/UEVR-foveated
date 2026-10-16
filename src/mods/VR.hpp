@@ -506,7 +506,9 @@ public:
     }
 
     bool is_depth_enabled() const {
-        return m_enable_depth->value();
+        // Our two mono projections have different extents and cannot share the
+        // regular stereo depth swapchain. Never submit mismatched depth data.
+        return !is_duoview_fixed() && m_enable_depth->value();
     }
 
     // Off while the view follows the aim, whatever the toggle says. The two want opposite things:
