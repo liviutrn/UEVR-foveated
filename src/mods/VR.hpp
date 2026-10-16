@@ -35,6 +35,8 @@ public:
         NATIVE_STEREO = 0,
         SYNCHRONIZED = 1,
         ALTERNATING = 2,
+        // Two sequential MONOSCOPIC scene renders: central high-res crop and low-res periphery.
+        DUOVIEW_FIXED_SEQUENTIAL = 3,
     };
 
     enum SynchronizeStage {
@@ -457,14 +459,21 @@ public:
         return m_openvr_mtx;
     }
 
+    // Deliberately a distinct rendering method. Never report DuoView as ordinary stereo/AFR.
+    bool is_duoview_fixed() const {
+        return m_rendering_method->value() == RenderingMethod::DUOVIEW_FIXED_SEQUENTIAL;
+    }
+
     bool is_using_afr() const {
         return m_rendering_method->value() == RenderingMethod::ALTERNATING || 
                m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
+               m_rendering_method->value() == RenderingMethod::DUOVIEW_FIXED_SEQUENTIAL ||
                m_extreme_compat_mode->value() == true;
     }
 
     bool is_using_synchronized_afr() const {
         return m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
+               m_rendering_method->value() == RenderingMethod::DUOVIEW_FIXED_SEQUENTIAL ||
                (m_extreme_compat_mode->value() && m_rendering_method->value() == RenderingMethod::NATIVE_STEREO);
     }
 
@@ -1023,6 +1032,7 @@ private:
         "Native Stereo",
         "Synchronized Sequential",
         "Alternating/AFR",
+        "DuoView Fixed Mono (Sequential DX12+OpenXR)",
     };
 
     static const inline std::vector<std::string> s_sync_mode_names{
