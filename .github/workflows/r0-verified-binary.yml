@@ -1,0 +1,52 @@
+name: R0 verified remleo r6 binary
+
+on:
+  push:
+    branches: [baseline/remleo-01143-r6]
+    paths:
+      - '.github/workflows/r0-verified-binary.yml'
+      - 'docs/BASELINE_R0.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download original r6 release and confirm SHA256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path output, verify | Out-Null
+          $url = "https://github.com/Remleo/UEVR/releases/download/remleo-01143-r6/uevr.zip"
+          $expected = "824709c32adfb37264f50a5b79d9dfbc132eaf0ad8eaa9853c770ca534b646e2"
+          Invoke-WebRequest -Uri $url -OutFile output/uevr.zip
+          $actual = (Get-FileHash -LiteralPath output/uevr.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Upstream r6 package hash mismatch: $actual"
+          }
+          Expand-Archive -LiteralPath output/uevr.zip -DestinationPath verify -Force
+          foreach ($file in @("UEVRBackend.dll", "UEVRInjector.exe")) {
+            if (-not @(Get-ChildItem verify -File -Recurse -Filter $file).Count) {
+              throw "Original package does not contain $file"
+            }
+          }
+          @(
+            "R0 baseline: verified upstream binary, NOT a new source compilation"
+            "UEVR source: Remleo/UEVR@4dd185f94b72f8cd385000d4ed06d2648155ffda"
+            "Release: https://github.com/Remleo/UEVR/releases/tag/remleo-01143-r6"
+            "Upstream ZIP SHA256: $actual"
+            "Do not confuse this binary verification job with the separate source build."
+          ) | Set-Content output/PROVENANCE.txt
+      - name: Upload exact verified r6 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: UEVR-Foveated-r0-original-remleo-r6
+          path: |
+            output/uevr.zip
+            output/PROVENANCE.txt
+          if-no-files-found: error
+          retention-days: 90

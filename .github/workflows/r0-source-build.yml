@@ -1,0 +1,138 @@
+name: R0 compile remleo r6 from source
+
+on:
+  push:
+    branches: [baseline/remleo-01143-r6]
+    paths:
+      - '.github/workflows/r0-source-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check private remleo UESDK authentication
+        shell: pwsh
+        env:
+          UESDK_PULLER: ${{ secrets.UESDK_PULLER }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:UESDK_PULLER)) {
+            throw "Repository secret UESDK_PULLER is missing. Add a READ-ONLY GitHub access token with permission to clone remleo/UESDK (and any needed nested private submodules), then re-run this job."
+          }
+      - name: Checkout baseline source with private submodules
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.UESDK_PULLER }}
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify remleo r6 source lineage and matching UESDK
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor 4dd185f94b72f8cd385000d4ed06d2648155ffda HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Not descended from the tested remleo r6 commit" }
+          $expected = "b1c6534652bd7381ad16e25f0507e3162e4b4691"
+          $actual = (git -C dependencies/submodules/UESDK rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Wrong UESDK revision; expected $expected, received $actual" }
+          Write-Host "Pinned remleo/UESDK matched: $actual"
+      - name: Configure backend with MSVC 2022
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { throw "Backend CMake configuration failed" }
+      - name: Compile UEVR backend
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target uevr --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "UEVR backend compilation failed" }
+      - name: Compile helper DLLs
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target vr-plugin-nullifier LuaVR --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "UEVR helper DLL build failed" }
+      - name: Get matching remleo frontend
+        shell: pwsh
+        run: |
+          git clone https://github.com/Remleo/uevr-frontend.git frontend
+          if ($LASTEXITCODE -ne 0) { throw "Failed to clone remleo frontend" }
+          git -C frontend checkout --detach b2fac6086a87714f5bb87637e65ff0b3c4a3fad7
+          if ($LASTEXITCODE -ne 0) { throw "Failed to checkout remleo frontend commit" }
+      - name: Set up .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+      - name: Compile and publish matching frontend
+        shell: pwsh
+        run: |
+          dotnet publish frontend --configuration Release --output build/bin/uevr
+          if ($LASTEXITCODE -ne 0) { throw "Remleo frontend compilation failed" }
+      - name: Verify compiled binaries exist
+        shell: pwsh
+        run: |
+          foreach ($name in @("UEVRBackend.dll", "UEVRInjector.exe")) {
+            if (-not (Test-Path "build/bin/uevr/$name")) { throw "Missing compiled $name" }
+          }
+      - name: Fetch original package to preserve untouched dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist, package | Out-Null
+          Invoke-WebRequest "https://github.com/Remleo/UEVR/releases/download/remleo-01143-r6/uevr.zip" -OutFile dist/original-r6.zip
+          $hash = (Get-FileHash dist/original-r6.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "824709c32adfb37264f50a5b79d9dfbc132eaf0ad8eaa9853c770ca534b646e2") { throw "Original release changed" }
+          Expand-Archive dist/original-r6.zip package -Force
+          if (-not (Test-Path package/UEVRBackend.dll) -or -not (Test-Path package/UEVRInjector.exe)) {
+            throw "Unexpected upstream ZIP layout; refusing to package incorrect path"
+          }
+      - name: Overlay source-built backend and matching injector
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("UEVRBackend.dll", "UEVRInjector.exe")) {
+            Copy-Item "build/bin/uevr/$name" "package/$name" -Force
+          }
+          foreach ($name in @("UEVRBackend.pdb", "UEVRInjector.pdb")) {
+            if (Test-Path "build/bin/uevr/$name") {
+              Copy-Item "build/bin/uevr/$name" "package/$name" -Force
+            }
+          }
+          foreach ($file in @(Get-ChildItem "build/bin/uevr" -File)) {
+            if ($file.Name -notin @("UEVRBackend.dll", "UEVRBackend.pdb", "UEVRInjector.exe", "UEVRInjector.pdb")) {
+              Copy-Item $file.FullName "package/$($file.Name)" -Force
+            }
+          }
+          foreach ($pair in @(
+            @{path="build/bin/vr-plugin-nullifier/UEVRPluginNullifier.dll"; name="UEVRPluginNullifier.dll"},
+            @{path="build/bin/LuaVR/LuaVR.dll"; name="LuaVR.dll"}
+          )) {
+            if (Test-Path $pair.path) {
+              Copy-Item $pair.path "package/$($pair.name)" -Force
+            }
+          }
+          $backendHash = (Get-FileHash package/UEVRBackend.dll -Algorithm SHA256).Hash
+          $injectorHash = (Get-FileHash package/UEVRInjector.exe -Algorithm SHA256).Hash
+          @(
+            "UEVR-Foveated r0 source compilation (not headset-tested)"
+            "Upstream UEVR: Remleo/UEVR@4dd185f94b72f8cd385000d4ed06d2648155ffda"
+            "UESDK: remleo/UESDK@b1c6534652bd7381ad16e25f0507e3162e4b4691"
+            "Frontend: Remleo/uevr-frontend@b2fac6086a87714f5bb87637e65ff0b3c4a3fad7"
+            "Build commit: ${{ github.sha }}"
+            "Backend SHA256: $backendHash"
+            "Injector SHA256: $injectorHash"
+            "Not byte-identical to original binary; runtime validation required."
+          ) | Set-Content package/UEVR_FOVEATED_BUILD.txt
+          Compress-Archive -Path package/* -DestinationPath dist/UEVR-Foveated-r0-source-built.zip -Force
+          (Get-FileHash dist/UEVR-Foveated-r0-source-built.zip -Algorithm SHA256).Hash | Set-Content dist/UEVR-Foveated-r0-source-built.zip.sha256
+      - name: Upload Windows source build
+        uses: actions/upload-artifact@v4
+        with:
+          name: UEVR-Foveated-r0-Windows-source-build
+          path: |
+            dist/UEVR-Foveated-r0-source-built.zip
+            dist/UEVR-Foveated-r0-source-built.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
